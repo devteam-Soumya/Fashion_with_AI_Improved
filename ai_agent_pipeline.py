@@ -64,7 +64,7 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-PORT       = int(os.getenv("PORT",        "8000"))
+PORT       = int(os.getenv("PORT",        "10000"))
 LOG_LEVEL  = os.getenv("LOG_LEVEL",       "info")
 OUTPUT_DIR = os.getenv("OUTPUT_DIR",      "./outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
