@@ -14,3 +14,4 @@ python-multipart
 # Gemini client (your code imports google.genai + google.genai.types)
 
 google-genai>=0.3.0
+
