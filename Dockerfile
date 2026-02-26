@@ -32,4 +32,4 @@ EXPOSE 8000
 
 # ---- Start server ----
 # IMPORTANT: run the correct module path: backend_full_gown_agent:app
-CMD uvicorn backend_full_gown_agent:app --host 0.0.0.0 --port $PORT
+CMD uvicorn ai_agent_pipeline:app --host 0.0.0.0 --port $PORT
