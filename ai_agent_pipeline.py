@@ -1411,7 +1411,7 @@ async def global_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     print(f"\nStarting on http://0.0.0.0:{PORT}")
     print(f"Swagger docs: http://localhost:{PORT}/docs\n")
-    port = int(os.getenv("PORT", "8000"))
+    port = int(os.getenv("PORT", "10000"))
     uvicorn.run(
         "ai_agent_pipeline:app",
         host="0.0.0.0",
