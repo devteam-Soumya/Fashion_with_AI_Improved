@@ -10,6 +10,7 @@ fal-client>=0.5.0
 # Optional (your code supports fallback if missing)
 rembg>=2.0.50
 onnxruntime>=1.17.0
-
+python-multipart
 # Gemini client (your code imports google.genai + google.genai.types)
+
 google-genai>=0.3.0
