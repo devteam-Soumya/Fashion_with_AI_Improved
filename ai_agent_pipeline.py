@@ -75,7 +75,7 @@ if FAL_KEY:
     os.environ["FAL_API_KEY"] = FAL_KEY
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL",   "gemini-2.0-flash")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL_ID",   "gemini-2.0-flash")
 
 FAL_CATVTON = "fal-ai/cat-vton"
 FAL_KONTEXT = "fal-ai/flux-kontext/dev"
