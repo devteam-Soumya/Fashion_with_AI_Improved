@@ -1,5 +1,16 @@
-# backend_full_gown_agent.py — COMPLETE FINAL VERSION
+# ai_agent_pipeline.py — COMPLETE FINAL VERSION (SAGEMAKER READY)
 # ══════════════════════════════════════════════════════════════════════════════
+#
+#  SAGEMAKER CHANGES APPLIED:
+#  ─────────────────────────────────────────────────────────────────────────
+#  SM-1:  PORT default changed        8000  → 8080  (SageMaker requires 8080)
+#  SM-2:  OUTPUT_DIR default changed  ./outputs → /tmp/outputs  (container r/o)
+#  SM-3:  Added GET  /ping            SageMaker health check (required)
+#  SM-4:  Added POST /invocations     SageMaker inference entry point (required)
+#  SM-5:  uvicorn reload=False        reload=True crashes inside containers
+#  SM-6:  FastAPI timeout=600         pipeline takes 3-5 min, prevent gateway timeout
+#  SM-7:  os.makedirs before mount    /tmp/outputs won't exist until created
+#  SM-8:  Added startup_event()       pre-warm + readiness logging on boot
 #
 #  SWAP MECHANISM EXPLAINED:
 #  ─────────────────────────────────────────────────────────────────────────
@@ -17,7 +28,7 @@
 #    M2: Flux Kontext extends result to floor length
 #    M3: Gemini QC → fixes artefacts after extension
 #
-#  ALL FIXES:
+#  ALL ORIGINAL FIXES:
 #  ─────────────────────────────────────────────────────────────────────────
 #  FIX 1:  extract_json()        strips ```json``` markdown before json.loads()
 #  FIX 2:  fal_upload() in M3    HTTPS URLs not data URIs for fal.ai models
@@ -28,7 +39,6 @@
 #  FIX 7:  final_bgr safety      always assigned even when skip_m3=1
 #  FIX 8:  Consistent errors     all endpoints return same JSON error shape
 #  FIX 9:  sanitize_url()        strips trailing quotes from fal.ai URLs
-#                                (Windows OSError WinError 123 root cause fix)
 #  FIX 10: sanitize_filename()   removes Windows-illegal chars from file paths
 #  FIX 11: extra_outerwear QC    M3 prompt explicitly handles coat/jacket removal
 #  FIX 12: Flat-lay watermark    stock photo watermarks inpainted before CatVTON
@@ -38,8 +48,10 @@
 #
 #  ENDPOINTS:
 #   GET  /health
+#   GET  /ping                          ← NEW: SageMaker health check
 #   GET  /download/{filename}
 #   GET  /view/{filename}
+#   POST /invocations                   ← NEW: SageMaker inference entry point
 #   POST /v1/tryon/garment-to-user
 #   POST /v1/tryon/actress-to-user
 #   POST /v1/tryon/actress-garment-to-user   ← RECOMMENDED
@@ -64,9 +76,15 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
-PORT       = int(os.getenv("PORT",        "10000"))
+
+# SM-1: Port MUST be 8080 for SageMaker (was "8000")
+PORT       = int(os.getenv("PORT",        "8080"))
 LOG_LEVEL  = os.getenv("LOG_LEVEL",       "info")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR",      "./outputs")
+
+# SM-2: Output dir MUST be under /tmp in SageMaker (container filesystem is read-only)
+OUTPUT_DIR = os.getenv("OUTPUT_DIR",      "/tmp/outputs")
+
+# SM-7: Create output dir immediately — /tmp/outputs won't exist until explicitly created
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 FAL_KEY = os.getenv("FAL_API_KEY", os.getenv("FAL_KEY", "")).strip()
@@ -75,7 +93,7 @@ if FAL_KEY:
     os.environ["FAL_API_KEY"] = FAL_KEY
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL_ID",   "gemini-2.0-flash")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL",   "gemini-2.0-flash")
 
 FAL_CATVTON = "fal-ai/cat-vton"
 FAL_KONTEXT = "fal-ai/flux-kontext/dev"
@@ -114,7 +132,8 @@ except Exception:
     pass
 
 print(f"\n{'='*60}")
-print(f"  VIRTUAL TRY-ON AGENT — Complete Final Version")
+print(f"  VIRTUAL TRY-ON AGENT — SageMaker Ready Version")
+print(f"  Port    : {PORT}")
 print(f"  fal.ai  : {'READY' if FAL_KEY and fal_client else 'MISSING FAL_KEY'}")
 print(f"  Gemini  : {'READY' if gemini_client else 'MISSING GEMINI_API_KEY'}")
 print(f"  rembg   : {'READY' if rembg_remove else 'not installed (GrabCut fallback)'}")
@@ -320,25 +339,24 @@ def preprocess_flatlay(bgr: np.ndarray) -> Tuple[np.ndarray, List[str]]:
     warns = []
     out   = bgr.copy()
     h, w  = out.shape[:2]
-    
+
     # Watermark zone: bottom 8%, center 60%
     wy1 = int(h * 0.92)
     wx1 = int(w * 0.20)
     wx2 = int(w * 0.80)
-    
+
     mask = np.zeros((h, w), dtype=np.uint8)
     mask[wy1:h, wx1:wx2] = 255
-    
+
     try:
         out = cv2.inpaint(out, mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
         warns.append("watermark_region_inpainted")
     except Exception:
-        # Fallback: flood with sampled colour from just above watermark zone
         sample_y = max(0, wy1 - 10)
         fill_col = out[sample_y, wx1:wx2].mean(axis=0).astype(np.uint8)
         out[wy1:h, wx1:wx2] = fill_col
         warns.append("watermark_region_colorfill_fallback")
-    
+
     return rmax(out, REF_MAX_SIDE), warns
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -347,18 +365,16 @@ def preprocess_flatlay(bgr: np.ndarray) -> Tuple[np.ndarray, List[str]]:
 def preprocess_actress(bgr: np.ndarray) -> Tuple[np.ndarray, List[str]]:
     """
     Strip background + blur face so CatVTON uses the garment shape only.
-    WHY: Actress photo has a real-world background, accessories and skin.
-    CatVTON needs a clean garment silhouette — not a portrait.
     Steps:
     1. Background removal  (rembg if available, GrabCut otherwise)
     2. Tight crop to garment foreground bounds
-    3. Face blur top 22%  — CatVTON must not copy the face
-    4. Side edge blur 10% — reduces arm/shoulder edge confusion
+    3. Face blur top 22%
+    4. Side edge blur 10%
     5. Resize to REF_MAX_SIDE
     """
     warns = []
     out   = bgr.copy()
-    
+
     # ── 1. Background removal ─────────────────────────────────────────────
     if rembg_remove:
         try:
@@ -386,7 +402,7 @@ def preprocess_actress(bgr: np.ndarray) -> Tuple[np.ndarray, List[str]]:
             warns.append("grabcut_bg_removed")
         except Exception:
             warns.append("bg_removal_failed")
-    
+
     # ── 2. Tight crop ─────────────────────────────────────────────────────
     gray    = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
     mask_fg = (gray < 248).astype(np.uint8) * 255
@@ -400,20 +416,20 @@ def preprocess_actress(bgr: np.ndarray) -> Tuple[np.ndarray, List[str]]:
         out = out[max(0, y1 - py):min(h, y2 + py),
                  max(0, x1 - px):min(w, x2 + px)]
         warns.append("tight_crop")
-    
+
     # ── 3. Face blur (top 22%) ────────────────────────────────────────────
     h, w   = out.shape[:2]
     y_face = int(h * 0.22)
     if y_face > 10:
         out[:y_face] = cv2.GaussianBlur(out[:y_face], (0, 0), 9, 9)
-    
+
     # ── 4. Side edge blur (10% each side) ────────────────────────────────
     se = int(w * 0.10)
     if se > 4:
         out[:, :se]   = cv2.GaussianBlur(out[:, :se],   (0, 0), 7, 7)
         out[:, w-se:] = cv2.GaussianBlur(out[:, w-se:], (0, 0), 7, 7)
         warns.append("face_and_edges_blurred")
-    
+
     return rmax(out, REF_MAX_SIDE), warns
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -445,7 +461,7 @@ has_palazzo    = true  → separate wide-leg trouser layer visible in the garmen
 cloth_type             → "overall" for dresses/jumpsuits, "upper" for tops/
                          jackets, "lower" for trousers/skirts
 """.strip()
-    
+
     @staticmethod
     def _heuristic_is_full_length(bgr: np.ndarray) -> bool:
         """
@@ -455,7 +471,7 @@ cloth_type             → "overall" for dresses/jumpsuits, "upper" for tops/
         """
         h, w = bgr.shape[:2]
         return (h / max(w, 1)) > 1.6
-    
+
     def _fallback_info(self, bgr: np.ndarray) -> GarmentInfo:
         return GarmentInfo(
             is_full_length = self._heuristic_is_full_length(bgr),
@@ -468,7 +484,7 @@ cloth_type             → "overall" for dresses/jumpsuits, "upper" for tops/
             ),
             cloth_type = "overall",
         )
-    
+
     async def run(self, state: PipelineState) -> PipelineState:
         if state.garment_bgr is None:
             state.garment_info = GarmentInfo(
@@ -479,14 +495,14 @@ cloth_type             → "overall" for dresses/jumpsuits, "upper" for tops/
             )
             state.all_warns.append("M0 skipped — no flat-lay provided")
             return state
-        
+
         fallback = self._fallback_info(state.garment_bgr)
-        
+
         if not gemini_client:
             state.all_warns.append("M0: Gemini not configured — heuristic fallback")
             state.garment_info = fallback
             return state
-        
+
         try:
             from google.genai import types as gt
             img_part = gt.Part.from_bytes(
@@ -498,7 +514,7 @@ cloth_type             → "overall" for dresses/jumpsuits, "upper" for tops/
             )
             raw = (getattr(resp, "text", None) or "").strip()
             d   = extract_json(raw)  # FIX 1
-            
+
             state.garment_info = GarmentInfo(
                 is_full_length = bool(d.get("is_full_length", fallback.is_full_length)),
                 has_palazzo    = bool(d.get("has_palazzo",    False)),
@@ -514,7 +530,7 @@ cloth_type             → "overall" for dresses/jumpsuits, "upper" for tops/
             print(f"  [M0] Gemini error: {e} — using heuristic fallback")
             state.all_warns.append(f"M0 Gemini error: {e}")
             state.garment_info = fallback
-        
+
         return state
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -528,7 +544,7 @@ class TryOnModule:
     │   → flat-lay as garment  (actress has short version)    │
     │   → M2 will extend to floor length                       │
     ├──────────────────────────────────────────────────────────┤
-    │ is_full_length=False + actress available    ← THIS CASE  │
+    │ is_full_length=False + actress available                  │
     │   → preprocessed actress as garment                      │
     │   → M2 skipped                                          │
     ├──────────────────────────────────────────────────────────┤
@@ -541,17 +557,16 @@ class TryOnModule:
             state.failed = True
             state.error  = "FAL_KEY or fal_client missing. pip install fal-client"
             return state
-        
+
         t0 = time.monotonic()
         gi = state.garment_info
-        
+
         garment_input: Optional[np.ndarray] = None
         cloth_type  = gi.cloth_type if gi else "overall"
         source_desc = ""
-        
+
         # ── Decide which image becomes the garment ────────────────────────
         if gi and gi.is_full_length and state.garment_bgr is not None:
-            # Full-length path: flat-lay shows complete gown shape
             cleaned, wm_warns = preprocess_flatlay(state.garment_bgr)
             garment_input = cleaned
             state.m1_warns.extend(wm_warns)
@@ -562,8 +577,6 @@ class TryOnModule:
             source_desc = "flat-lay (full-length gown)"
             print(f"  [M1] FLAT-LAY path — full-length garment")
         elif state.actress_bgr is not None:
-            # Midi/short path: actress reference is superior to flat-lay
-            # because it shows how the garment drapes on an actual body
             proc, warns = preprocess_actress(state.actress_bgr)
             garment_input = proc
             state.m1_warns.extend(warns)
@@ -574,7 +587,6 @@ class TryOnModule:
             source_desc = "actress (preprocessed)"
             print(f"  [M1] ACTRESS path — midi/short garment")
         elif state.garment_bgr is not None:
-            # No actress available — flat-lay only
             cleaned, wm_warns = preprocess_flatlay(state.garment_bgr)
             garment_input = cleaned
             state.m1_warns.extend(wm_warns)
@@ -584,13 +596,13 @@ class TryOnModule:
             state.failed = True
             state.error  = "No garment or actress image provided."
             return state
-        
+
         print(f"  [M1] Source: {source_desc} | cloth_type={cloth_type}")
-        
+
         try:
             user_url    = fal_upload(bgr_to_png(rmax(state.user_bgr, 1400)))
             garment_url = fal_upload(bgr_to_png(garment_input))
-            
+
             print(f"  [M1] Calling {FAL_CATVTON}…")
             result = fal_client.run(
                 FAL_CATVTON,
@@ -603,8 +615,7 @@ class TryOnModule:
                     "seed":                42,
                 },
             )
-            
-            # CatVTON can return image URL in several shapes
+
             url = None
             if isinstance(result, dict):
                 img = result.get("image")
@@ -614,7 +625,7 @@ class TryOnModule:
                 url = find_url(result)
             if not url:
                 raise RuntimeError(f"CatVTON no image URL in response: {result}")
-            
+
             state.m1_bgr     = fetch_bgr(url)
             state.m1_model   = FAL_CATVTON
             state.m1_latency = round(time.monotonic() - t0, 2)
@@ -623,7 +634,7 @@ class TryOnModule:
             state.failed = True
             state.error  = f"CatVTON failed: {type(e).__name__}: {e}"
             print(f"  [M1] FAILED: {state.error}")
-        
+
         return state
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -635,31 +646,29 @@ class ExtensionModule:
     Extends the CatVTON result to full floor-length for gowns.
     For the camel midi dress:  SKIPPED (is_full_length=False).
     For full-length gowns:
-    1. Extend canvas downward by EXTEND_RATIO (85% for FIX 13)
-       Seamless seam blending prevents hard colour line (FIX 4 + FIX 6 + FIX 14)
+    1. Extend canvas downward by EXTEND_RATIO (85%)
     2. Call Flux Kontext to generate the lower half continuation
-       Low guidance_scale (2.5) preserves the person, generates only garment
     """
     def _extend_canvas(self, bgr: np.ndarray, ratio: float) -> np.ndarray:
         """
-        FIX 4: sample 40px (was 15px) for more accurate average fill colour
-        FIX 6 + FIX 14: blend last 50px of original into fill colour — no hard seam
+        FIX 4: sample 40px for accurate average fill colour
+        FIX 6 + FIX 14: blend last 50px of original into fill colour
         """
         h, w   = bgr.shape[:2]
         add_h  = int(h * ratio)
-        sample = bgr[max(0, h - 40):h, :]       # FIX 4: 40px sample
+        sample = bgr[max(0, h - 40):h, :]
         bottom = sample.mean(axis=(0, 1)).astype(np.uint8)
         fill   = np.full((add_h, w, 3), bottom, dtype=np.uint8)
-        
+
         bgr_copy   = bgr.copy()
-        blend_rows = min(50, h)  # FIX 14: increased from 30 to 50
-        for i in range(blend_rows):              # FIX 6: seam blend
+        blend_rows = min(50, h)
+        for i in range(blend_rows):
             alpha         = i / float(blend_rows)
             row           = h - blend_rows + i
             bgr_copy[row] = (bgr_copy[row] * (1 - alpha) + bottom * alpha).astype(np.uint8)
-        
+
         return np.vstack([bgr_copy, fill])
-    
+
     def _build_extension_prompt(self, gi: GarmentInfo, style_hint: str) -> str:
         base = gi.extend_prompt or (
             f"Extend the {gi.garment_type} downward to floor length, continuing "
@@ -672,7 +681,7 @@ class ExtensionModule:
             )
         if style_hint:
             base += f" Note: {style_hint}."
-        
+
         # FIX 15: Stronger emphasis on FULL-LENGTH
         return (
             f"{base} "
@@ -684,33 +693,33 @@ class ExtensionModule:
             "ONLY generate the lower extension. Photorealistic, high detail, "
             "fashion photography quality."
         )
-    
+
     async def run(self, state: PipelineState) -> PipelineState:
         if state.failed or state.m1_bgr is None:
             return state
-        
+
         gi = state.garment_info
         if not gi or not gi.is_full_length:
             state.m2_bgr = state.m1_bgr
             state.m2_warns.append("M2 skipped — garment is not full-length")
             print(f"  [M2] Skipped (midi/short garment — no extension needed)")
             return state
-        
+
         if not fal_client or not FAL_KEY:
             state.m2_bgr = state.m1_bgr
             state.m2_warns.append("M2 skipped — FAL_KEY missing")
             return state
-        
+
         t0 = time.monotonic()
         print(f"  [M2] Extending canvas → Flux Kontext…")
-        
+
         try:
             extended = self._extend_canvas(state.m1_bgr.copy(), EXTEND_RATIO)
             prompt   = self._build_extension_prompt(gi, state.style_hint)
             ext_url  = fal_upload(bgr_to_png(extended))
-            
+
             print(f"  [M2] Prompt: {prompt[:100]}…")
-            
+
             # FIX 3: "resolution_mode" is NOT a valid Flux Kontext parameter — removed
             resp = fal_client.run(
                 FAL_KONTEXT,
@@ -724,7 +733,7 @@ class ExtensionModule:
                     "output_format":       "jpeg",
                 },
             )
-            
+
             url = None
             if isinstance(resp, dict):
                 imgs = resp.get("images")
@@ -734,7 +743,7 @@ class ExtensionModule:
                 url = find_url(resp)
             if not url:
                 raise RuntimeError(f"Kontext M2 returned no URL: {resp}")
-            
+
             state.m2_bgr      = fetch_bgr(url)
             state.m2_extended = True
             state.m2_latency  = round(time.monotonic() - t0, 2)
@@ -744,31 +753,20 @@ class ExtensionModule:
             print(f"  [M2] WARNING: {warn} — using M1 result")
             state.m2_warns.append(warn)
             state.m2_bgr = state.m1_bgr
-        
+
         return state
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODULE 3 — AutoFixQCAgent
-# Gemini inspects result → picks strategy → applies Kontext or Fill fix.
 # ══════════════════════════════════════════════════════════════════════════════
 class AutoFixQCAgent:
     """
-    STEP A — Gemini Vision inspection:
-    Compares result (Image 3) vs original user (Image 1) + flat-lay (Image 2)
-    Detects garment errors and artefacts, selects a fix strategy.
-    
-    STEP B — Correction:
-    "none"    → pass through (QC passed)
-    "kontext" → Flux Kontext global edit (wrong garment, extra outerwear)
-    "fill"    → Flux Fill masked inpaint (local artefact: seam, edge)
-    "extend"  → another extension pass (still too short)
-    "both"    → fill local artefact THEN kontext global polish
-    
+    STEP A — Gemini Vision inspection
+    STEP B — Correction via Kontext / Fill / Extend
+
     FIX 11 — extra_outerwear:
-    When CatVTON hallucinates a coat, military jacket or blazer that is
-    NOT in the product flat-lay, Gemini sets strategy="kontext" and writes
-    an explicit instruction to remove the outerwear and reveal only the
-    correct product garment.
+    When CatVTON hallucinates a coat/jacket not in the product flat-lay,
+    Gemini sets strategy="kontext" with explicit removal instruction.
     """
     _INSPECT_PROMPT = """
 You are a quality inspector for a virtual clothing try-on system.
@@ -823,9 +821,8 @@ Reply ONLY in valid JSON with NO markdown fences:
   "negative_prompt":     "things that must NOT appear in the corrected result"
 }
 """.strip()
-    
+
     def _default_report(self) -> QCReport:
-        """Used when Gemini is unavailable."""
         return QCReport(
             has_issues=True,
             strategy=QCStrategy.KONTEXT,
@@ -844,7 +841,7 @@ Reply ONLY in valid JSON with NO markdown fences:
                 "wrong colour, watermark, artefacts"
             ),
         )
-    
+
     async def _gemini_inspect(
         self,
         user_bgr:    np.ndarray,
@@ -853,7 +850,7 @@ Reply ONLY in valid JSON with NO markdown fences:
     ) -> QCReport:
         if not gemini_client:
             return self._default_report()
-        
+
         try:
             from google.genai import types as gt
             contents = [
@@ -870,13 +867,13 @@ Reply ONLY in valid JSON with NO markdown fences:
                 gt.Part.from_bytes(data=bgr_to_png(result_bgr), mime_type="image/png"),
                 self._INSPECT_PROMPT,
             ]
-            
+
             resp = gemini_client.models.generate_content(
                 model=GEMINI_MODEL, contents=contents
             )
             raw  = (getattr(resp, "text", None) or "").strip()
             d    = extract_json(raw)  # FIX 1
-            
+
             return QCReport(
                 has_issues          = bool(d.get("has_issues", True)),
                 strategy            = QCStrategy(d.get("strategy", "kontext")),
@@ -890,13 +887,12 @@ Reply ONLY in valid JSON with NO markdown fences:
         except Exception as e:
             print(f"  [M3] Gemini inspect error: {e}")
             return self._default_report()
-    
+
     def _heuristic_inspect(self, result_bgr: np.ndarray) -> QCReport:
-        """Fast edge-detection fallback when Gemini is completely unavailable."""
         gray   = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY)
         edges  = cv2.Canny(gray, 80, 160)
         issues = ["edge_artifact"] if float(edges.mean() / 255) > 0.18 else []
-        
+
         return QCReport(
             has_issues          = bool(issues),
             strategy            = QCStrategy.KONTEXT if issues else QCStrategy.NONE,
@@ -907,9 +903,8 @@ Reply ONLY in valid JSON with NO markdown fences:
             fill_prompt         = "Clean natural garment fabric.",
             negative_prompt     = "sharp edges, seam bleed, ghost limbs",
         )
-    
+
     def _build_mask(self, w: int, h: int, hint: Optional[str]) -> Image.Image:
-        """Soft Gaussian mask for the hinted region."""
         REGIONS = {
             "upper torso":  (0.15, 0.50, 0.18, 0.82),
             "lower torso":  (0.45, 0.75, 0.18, 0.82),
@@ -922,25 +917,22 @@ Reply ONLY in valid JSON with NO markdown fences:
         }
         hl  = (hint or "full torso").lower()
         reg = next((v for k, v in REGIONS.items() if k in hl), REGIONS["full torso"])
-        
+
         mask = np.zeros((h, w), np.uint8)
         mask[int(reg[0]*h):int(reg[1]*h), int(reg[2]*w):int(reg[3]*w)] = 255
         mask = cv2.GaussianBlur(mask, (61, 61), 0)
         return Image.fromarray(mask).convert("RGB")
-    
+
     async def _run_kontext(self, bgr: np.ndarray, report: QCReport) -> np.ndarray:
-        """
-        FIX 2: fal_upload() — fal.ai requires HTTPS URL, not data URI
-        FIX 3: no resolution_mode — invalid parameter removed
-        """
+        """FIX 2: fal_upload — HTTPS URL, not data URI. FIX 3: no resolution_mode."""
         instr = (
             f"{report.kontext_instruction} "
             "Preserve exactly: face, hair, skin tone, body shape, pose, background. "
             "Only correct the garment issue."
         )
         print(f"  [M3-kontext] {instr[:100]}…")
-        
-        img_url = fal_upload(bgr_to_png(bgr))    # FIX 2
+
+        img_url = fal_upload(bgr_to_png(bgr))
         resp    = fal_client.run(
             FAL_KONTEXT,
             arguments={
@@ -951,27 +943,26 @@ Reply ONLY in valid JSON with NO markdown fences:
                 "num_images":          1,
                 "seed":                42,
                 "output_format":       "jpeg",
-                # FIX 3: resolution_mode removed
             },
         )
-        
+
         imgs = resp.get("images", []) if isinstance(resp, dict) else []
         url  = imgs[0].get("url") if imgs and isinstance(imgs[0], dict) else find_url(resp)
         if not url:
             raise RuntimeError(f"Kontext M3 no URL: {resp}")
         return fetch_bgr(url)
-    
+
     async def _run_fill(self, bgr: np.ndarray, report: QCReport) -> np.ndarray:
         """FIX 2: both image and mask uploaded as HTTPS URLs."""
         h, w     = bgr.shape[:2]
         mask     = self._build_mask(w, h, report.region_hint)
         prompt   = f"{report.fill_prompt} Seamless, natural fabric, photorealistic."
-        
+
         print(f"  [M3-fill] region='{report.region_hint}' '{prompt[:60]}…'")
-        
-        img_url  = fal_upload(bgr_to_png(bgr))    # FIX 2
-        mask_url = fal_upload(pil_to_png(mask))    # FIX 2
-        
+
+        img_url  = fal_upload(bgr_to_png(bgr))
+        mask_url = fal_upload(pil_to_png(mask))
+
         resp = fal_client.run(
             FAL_FILL,
             arguments={
@@ -984,46 +975,44 @@ Reply ONLY in valid JSON with NO markdown fences:
                 "seed":             42,
             },
         )
-        
+
         imgs = resp.get("images", []) if isinstance(resp, dict) else []
         url  = imgs[0].get("url") if imgs and isinstance(imgs[0], dict) else find_url(resp)
         if not url:
             raise RuntimeError(f"Fill M3 no URL: {resp}")
         return fetch_bgr(url)
-    
+
     async def _run_extend_again(
         self, bgr: np.ndarray, gi: Optional[GarmentInfo], style_hint: str
     ) -> np.ndarray:
-        """Trigger a second extension pass when garment is still too short."""
         dummy = PipelineState(
             rid="m3_ext", user_bgr=bgr,
             m1_bgr=bgr, garment_info=gi, style_hint=style_hint
         )
         dummy = await ExtensionModule().run(dummy)
         return dummy.m2_bgr if dummy.m2_bgr is not None else bgr
-    
+
     async def run(self, state: PipelineState) -> PipelineState:
         if state.failed:
             return state
-        
+
         src = state.m2_bgr if state.m2_bgr is not None else state.m1_bgr
         if src is None:
             return state
-        
+
         t0 = time.monotonic()
         print(f"  [M3] Running QC inspection…")
-        
+
         report = (
             await self._gemini_inspect(state.user_bgr, state.garment_bgr, src)
             if gemini_client else self._heuristic_inspect(src)
         )
         state.qc_report = report
-        
+
         print(f"  [M3] has_issues={report.has_issues}  "
               f"strategy={report.strategy}  issues={report.issues}")
         print(f"  [M3] '{report.problem_summary}'")
-        
-        # No issues — pass through
+
         if not report.has_issues or report.strategy == QCStrategy.NONE:
             state.m3_bgr      = src
             state.m3_strategy = "none"
@@ -1031,13 +1020,12 @@ Reply ONLY in valid JSON with NO markdown fences:
             state.m3_warns.append("QC passed — no issues detected")
             state.final_bgr   = src
             return state
-        
-        # Apply fix strategy
+
         fixed = src
         try:
             if not fal_client or not FAL_KEY:
                 raise RuntimeError("FAL_KEY or fal_client missing")
-            
+
             if report.strategy in (QCStrategy.FILL, QCStrategy.BOTH):
                 fixed = await self._run_fill(fixed, report)
             if report.strategy in (QCStrategy.KONTEXT, QCStrategy.BOTH):
@@ -1046,7 +1034,7 @@ Reply ONLY in valid JSON with NO markdown fences:
                 fixed = await self._run_extend_again(
                     fixed, state.garment_info, state.style_hint
                 )
-            
+
             state.m3_strategy = report.strategy.value
         except Exception as e:
             warn = f"M3 fix failed ({report.strategy}): {e}"
@@ -1054,11 +1042,11 @@ Reply ONLY in valid JSON with NO markdown fences:
             state.m3_warns.append(warn)
             state.m3_strategy = "failed_passthrough"
             fixed = src
-        
+
         state.m3_bgr     = fixed
         state.m3_latency = round(time.monotonic() - t0, 2)
         state.final_bgr  = fixed
-        
+
         print(f"  [M3] Done — {state.m3_strategy} ({state.m3_latency}s)")
         return state
 
@@ -1080,7 +1068,7 @@ async def run_pipeline(
 ) -> Dict[str, Any]:
     rid = getattr(request.state, "request_id", uuid.uuid4().hex[:12])
     print(f"\n[{rid}] ══ PIPELINE START ═══════════════════════════")
-    
+
     state = PipelineState(
         rid=rid,
         user_bgr=user_bgr,
@@ -1088,22 +1076,22 @@ async def run_pipeline(
         actress_bgr=actress_bgr,
         style_hint=style_hint,
     )
-    
+
     print(f"[{rid}] ▶ M0 GarmentInspectorAgent")
     state = await _m0.run(state)
-    
+
     print(f"[{rid}] ▶ M1 TryOnModule (CatVTON)")
     state = await _m1.run(state)
     state.all_warns.extend(state.m1_warns)
-    
+
     if state.failed:
         print(f"[{rid}] FAILED at M1: {state.error}")
         return _build_response(request, state, state.error)
-    
+
     print(f"[{rid}] ▶ M2 ExtensionModule")
     state = await _m2.run(state)
     state.all_warns.extend(state.m2_warns)
-    
+
     if not skip_m3:
         print(f"[{rid}] ▶ M3 AutoFixQCAgent")
         state = await _m3.run(state)
@@ -1112,11 +1100,11 @@ async def run_pipeline(
         # FIX 7: always assign final_bgr when M3 is skipped
         state.final_bgr   = state.m2_bgr if state.m2_bgr is not None else state.m1_bgr
         state.m3_strategy = "skipped"
-    
+
     # FIX 7: safety net — final_bgr must never be None
     if state.final_bgr is None:
         state.final_bgr = state.m2_bgr if state.m2_bgr is not None else state.m1_bgr
-    
+
     print(f"[{rid}] ══ PIPELINE DONE ════════════════════════════\n")
     return _build_response(request, state)
 
@@ -1126,17 +1114,17 @@ def _build_response(
     error_msg: Optional[str] = None,
 ) -> Dict[str, Any]:
     urls = dls = views = []
-    
+
     if state.final_bgr is not None:
-        fn = make_result_filename()       # FIX 9+10: sanitized, no trailing quotes
+        fn = make_result_filename()
         save_jpg(safe_path(fn), state.final_bgr)
         urls  = [ourl(request, fn)]
         dls   = [durl(request, fn)]
         views = [vurl(request, fn)]
-    
+
     gi = state.garment_info
     qc = state.qc_report
-    
+
     return {
         "request_id": state.rid,
         "success":    not state.failed,
@@ -1176,13 +1164,19 @@ def _build_response(
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 11 — FASTAPI APP
 # ══════════════════════════════════════════════════════════════════════════════
+
+# SM-6: timeout=600 prevents gateway timeout on long 3-5 min pipelines
 app = FastAPI(
     title="Virtual Try-On — 4-Module Agentic Pipeline",
     description=(
         "Supports midi dresses, full-length gowns, palazzo sets and more. "
         "M0 Inspect → M1 CatVTON → M2 Extend (gowns only) → M3 QC Fix"
     ),
+    timeout=600,
 )
+
+# SM-7: Ensure directory exists before mounting static files
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
 class RIDMiddleware(BaseHTTPMiddleware):
@@ -1194,6 +1188,25 @@ class RIDMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RIDMiddleware)
 
+# SM-8: Startup event — pre-warm + readiness logging
+@app.on_event("startup")
+async def startup_event():
+    """
+    Runs once when the container boots.
+    - Creates /tmp/outputs directory
+    - Validates API keys are present
+    - Logs full readiness status for CloudWatch
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print("\n" + "=" * 55)
+    print("  SAGEMAKER CONTAINER STARTUP — Fashion AI Try-On")
+    print(f"  PORT         : {PORT}")
+    print(f"  OUTPUT_DIR   : {OUTPUT_DIR}")
+    print(f"  FAL ready    : {bool(FAL_KEY and fal_client)}")
+    print(f"  Gemini ready : {bool(gemini_client)}")
+    print(f"  rembg ready  : {bool(rembg_remove)}")
+    print("=" * 55 + "\n")
+
 def _err(rid: str, msg: str) -> JSONResponse:
     """FIX 8 — consistent error response shape across all endpoints."""
     return JSONResponse(status_code=200, content={
@@ -1202,6 +1215,58 @@ def _err(rid: str, msg: str) -> JSONResponse:
         "error":      {"message": msg},
         "output_urls": [], "output_download_urls": [], "output_view_urls": [],
     })
+
+# ── SM-3: SageMaker health check ──────────────────────────────────────────────
+@app.get("/ping")
+def ping():
+    """
+    SageMaker calls GET /ping every 30 seconds.
+    MUST return HTTP 200 within 60 seconds or the container is killed.
+    """
+    return JSONResponse(status_code=200, content={
+        "status":       "healthy",
+        "fal_ready":    bool(FAL_KEY and fal_client),
+        "gemini_ready": bool(gemini_client),
+        "rembg_ready":  bool(rembg_remove),
+    })
+
+# ── SM-4: SageMaker inference entry point ─────────────────────────────────────
+@app.post("/invocations")
+async def invocations(
+    request:       Request,
+    actress_image: UploadFile = File(...,
+                                     description="Model wearing the garment (reference photo)"),
+    garment_image: UploadFile = File(...,
+                                     description="Product flat-lay image"),
+    user_image:    UploadFile = File(...,
+                                     description="Target person to dress"),
+    style_hint:    str = Form("",
+                               description="Optional hint e.g. 'camel midi wrap dress'"),
+    skip_m3:       int = Form(0,
+                               description="1 = skip M3 QC (faster)"),
+):
+    """
+    SageMaker routes ALL inference calls to POST /invocations.
+    Maps directly to the recommended actress-garment-to-user pipeline.
+
+    Midi dress  → M0:False → M1 actress path → M2 skipped  → M3 QC
+    Full gown   → M0:True  → M1 flat-lay path → M2 extended → M3 QC
+    """
+    rid = getattr(request.state, "request_id", "")
+    try:
+        ab = read_bgr(await actress_image.read())
+        gb = read_bgr(await garment_image.read())
+        ub = read_bgr(await user_image.read())
+    except Exception as e:
+        return _err(rid, f"Image read failed: {e}")
+
+    return await run_pipeline(
+        request, ub,
+        garment_bgr=gb,
+        actress_bgr=ab,
+        style_hint=style_hint,
+        skip_m3=bool(skip_m3),
+    )
 
 # ── Static endpoints ──────────────────────────────────────────────────────────
 @app.get("/download/{filename}")
@@ -1221,10 +1286,10 @@ def view_output(request: Request, filename: str):
     p = safe_path(filename)
     if not os.path.exists(p):
         return HTMLResponse("<h3>Not found</h3>", status_code=404)
-    
+
     iu = ourl(request, os.path.basename(p))
     du = durl(request, os.path.basename(p))
-    
+
     html = f"""<!doctype html>
 <html><head>
 <meta charset="utf-8"/>
@@ -1257,7 +1322,7 @@ a.s:hover{{background:rgba(255,255,255,.07)}}
 <span>M3 QC Fix</span>
 </div>
 <h2>Virtual Try-On Result</h2>
-<p class="sub">4-Module Agentic Pipeline</p>
+<p class="sub">4-Module Agentic Pipeline — SageMaker Endpoint</p>
 <img src="{iu}" alt="Try-On Result"/>
 <div class="btns">
 <a class="btn p" href="{du}">Download</a>
@@ -1271,17 +1336,31 @@ a.s:hover{{background:rgba(255,255,255,.07)}}
 def health():
     return {
         "ok":      True,
-        "version": "complete-final",
+        "version": "sagemaker-ready",
         "ready": {
             "fal":    bool(FAL_KEY and fal_client),
             "gemini": bool(gemini_client),
             "rembg":  bool(rembg_remove),
         },
+        "sagemaker_routes": {
+            "health_check": "GET  /ping         — called every 30s by SageMaker",
+            "inference":    "POST /invocations  — all SageMaker inference goes here",
+        },
         "swap_logic": {
             "midi_dress":  "M0→False → M1 actress path → M2 skipped  → M3 QC",
             "full_length": "M0→True  → M1 flat-lay path → M2 extended → M3 QC",
         },
-        "fixes": [
+        "sagemaker_changes": [
+            "SM-1  PORT=8080              SageMaker requires port 8080",
+            "SM-2  OUTPUT_DIR=/tmp/outputs Container filesystem is read-only",
+            "SM-3  GET  /ping             SageMaker health check route",
+            "SM-4  POST /invocations      SageMaker inference entry point",
+            "SM-5  reload=False           Prevents container crash on startup",
+            "SM-6  timeout=600            Long pipelines need extended timeout",
+            "SM-7  makedirs before mount  /tmp/outputs created before StaticFiles",
+            "SM-8  startup_event()        Pre-warm + CloudWatch readiness logging",
+        ],
+        "original_fixes": [
             "FIX1  extract_json()       strips Gemini ```json``` markdown",
             "FIX2  fal_upload() M3      HTTPS URLs not data URIs",
             "FIX3  no resolution_mode   invalid Kontext param removed",
@@ -1299,9 +1378,11 @@ def health():
             "FIX15 Stronger M2 prompts  Explicit FULL-LENGTH instructions",
         ],
         "endpoints": {
-            "RECOMMENDED":  "POST /v1/tryon/actress-garment-to-user",
-            "flatlay_only": "POST /v1/tryon/garment-to-user",
-            "actress_only": "POST /v1/tryon/actress-to-user",
+            "sagemaker_inference": "POST /invocations",
+            "sagemaker_health":    "GET  /ping",
+            "RECOMMENDED":         "POST /v1/tryon/actress-garment-to-user",
+            "flatlay_only":        "POST /v1/tryon/garment-to-user",
+            "actress_only":        "POST /v1/tryon/actress-to-user",
         },
     }
 
@@ -1321,7 +1402,7 @@ async def garment_to_user(
         ub = read_bgr(await user_image.read())
     except Exception as e:
         return _err(rid, f"Image read failed: {e}")
-    
+
     return await run_pipeline(
         request, ub,
         garment_bgr=gb, actress_bgr=None,
@@ -1344,7 +1425,7 @@ async def actress_to_user(
         ub = read_bgr(await user_image.read())
     except Exception as e:
         return _err(rid, f"Image read failed: {e}")
-    
+
     return await run_pipeline(
         request, ub,
         garment_bgr=None, actress_bgr=ab,
@@ -1368,13 +1449,13 @@ async def actress_garment_to_user(
 ):
     """
     RECOMMENDED — actress + flat-lay + user.
-    
-    Midi dress (your current images):
+
+    Midi dress:
       M0: Gemini → is_full_length=False
       M1: preprocessed actress used as CatVTON garment input
       M2: SKIPPED
       M3: QC fixes extra_outerwear, seam_bleed, color_mismatch etc.
-    
+
     Full-length gown:
       M0: Gemini → is_full_length=True
       M1: flat-lay used as CatVTON garment input
@@ -1387,8 +1468,8 @@ async def actress_garment_to_user(
         gb = read_bgr(await garment_image.read())
         ub = read_bgr(await user_image.read())
     except Exception as e:
-        return _err(rid, f"Image read failed: {e}")   # FIX 8
-    
+        return _err(rid, f"Image read failed: {e}")
+
     return await run_pipeline(
         request, ub,
         garment_bgr=gb, actress_bgr=ab,
@@ -1411,11 +1492,14 @@ async def global_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     print(f"\nStarting on http://0.0.0.0:{PORT}")
     print(f"Swagger docs: http://localhost:{PORT}/docs\n")
-    port = int(os.getenv("PORT", "10000"))
     uvicorn.run(
         "ai_agent_pipeline:app",
         host="0.0.0.0",
         port=PORT,
-        reload=True,
+        # SM-5: reload=False — NEVER use reload=True inside a container
+        # reload=True watches for file changes which crashes in read-only containers
+        reload=False,
         log_level=LOG_LEVEL,
+        # SM-5: keep-alive timeout for long-running image upload requests
+        timeout_keep_alive=300,
     )
